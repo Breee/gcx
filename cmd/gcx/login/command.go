@@ -6,8 +6,10 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"slices"
 	"sort"
 	"strings"
+	"time"
 
 	"charm.land/huh/v2"
 	configcmd "github.com/grafana/gcx/cmd/gcx/config"
@@ -57,7 +59,12 @@ type loginOpts struct {
 	AllowServerOverride bool
 	OAuthCallbackPort   int
 	OAuthManual         bool
-	OrgID               int
+	OIDC                bool
+	OIDCIssuer          string
+	OIDCClientID        string
+	// oidcScopes carries the scopes of a stored OIDC context into re-login.
+	oidcScopes []string
+	OrgID      int
 
 	// signup marks the `gcx signup` command, which shares this pipeline. It
 	// is set by SignupCommand, never by a flag.
@@ -72,6 +79,11 @@ func (opts *loginOpts) commandPath() string {
 	return "gcx login"
 }
 
+// oidc reports that this login uses a generic OIDC identity provider.
+func (opts *loginOpts) oidc() bool {
+	return opts.OIDC || opts.OIDCIssuer != "" || opts.OIDCClientID != ""
+}
+
 // Test seams for the browser flow, connectivity validation and the terminal
 // check, so command tests can take a login past the browser step without a
 // browser or a network, as if run from a terminal. A nil validateConnection
@@ -81,6 +93,9 @@ func (opts *loginOpts) commandPath() string {
 var (
 	newAuthFlow = func(server string, ao internalauth.Options) login.AuthFlow {
 		return internalauth.NewFlow(server, ao)
+	}
+	newOIDCFlow = func(oo internalauth.OIDCOptions) login.OIDCFlow {
+		return internalauth.NewOIDCFlow(oo)
 	}
 	validateConnection func(ctx context.Context, opts login.Options, restCfg config.NamespacedRESTConfig) (string, error)
 	stdinIsTerminal    = func() bool { return term.IsTerminal(int(os.Stdin.Fd())) }
@@ -115,6 +130,9 @@ func (opts *loginOpts) setup(flags *pflag.FlagSet) {
 	flags.IntVar(&opts.OAuthCallbackPort, "oauth-callback-port", 0, oauthCallbackPortUsage)
 	flags.BoolVar(&opts.OAuthManual, "oauth-manual", false, oauthManualUsage+". Implies --oauth")
 	flags.IntVar(&opts.OrgID, "org-id", 0, "Grafana organization ID (defaults to 1 for on-prem)")
+	flags.BoolVar(&opts.OIDC, "oidc", false, "Log in with the OIDC identity provider behind the Grafana server's SSO login (e.g. Entra ID) and send its ID token to Grafana, which must accept it via [auth.jwt]. gcx reads the issuer and client ID from Grafana's login redirect")
+	flags.StringVar(&opts.OIDCIssuer, "oidc-issuer", "", "OIDC issuer URL for --oidc, e.g. https://login.microsoftonline.com/<tenant-id>/v2.0. Overrides discovery; requires --oidc-client-id. Implies --oidc")
+	flags.StringVar(&opts.OIDCClientID, "oidc-client-id", "", "Public client ID for --oidc. Overrides discovery; requires --oidc-issuer. Implies --oidc")
 }
 
 // Usage text for the browser OAuth flags that `gcx login` and `gcx signup`
@@ -192,6 +210,32 @@ func (opts *loginOpts) Validate(args []string) error {
 			},
 		}
 	}
+	opts.OIDCIssuer = strings.TrimSpace(opts.OIDCIssuer)
+	opts.OIDCClientID = strings.TrimSpace(opts.OIDCClientID)
+	if opts.oidc() {
+		if (opts.OIDCIssuer == "") != (opts.OIDCClientID == "") {
+			return gcxerrors.DetailedError{
+				Summary: "incomplete OIDC options",
+				Details: "--oidc-issuer and --oidc-client-id must be used together",
+				Suggestions: []string{
+					"Use --oidc alone to read both from the Grafana server's SSO login",
+					"Or pass both: gcx login --server <grafana-url> --oidc-issuer <issuer-url> --oidc-client-id <client-id>",
+				},
+			}
+		}
+		if opts.OAuth || opts.Token != "" || opts.BasicAuth || opts.Cloud || opts.signup {
+			return gcxerrors.DetailedError{
+				Summary: "conflicting authentication methods",
+				Details: "--oidc is mutually exclusive with --oauth, --token, --basic-auth and --cloud",
+				Suggestions: []string{
+					"Use --oidc alone to log in with your identity provider",
+				},
+			}
+		}
+		// --oauth-manual and --oauth-callback-port apply to the OIDC browser
+		// flow too; do not fold them into the Grafana Cloud OAuth flow.
+		return nil
+	}
 	// --oauth-manual is a complete selection on its own. Fold it into OAuth
 	// here, after the conflict checks above, so the opts are self-consistent for
 	// every gate that reads OAuth later.
@@ -226,6 +270,10 @@ Grafana Cloud account, run gcx signup.
 
 Auth sources (for non-interactive use):
   --oauth        Browser-based OAuth (recommended for Grafana Cloud). Opens a browser for the user to approve; works in agent mode.
+  --oidc         Browser login with the OIDC identity provider behind Grafana's SSO login
+                 (e.g. Entra ID); issuer and client ID are read from Grafana. The ID token is
+                 sent to Grafana, which must accept it via [auth.jwt]. --oidc-issuer and
+                 --oidc-client-id override the discovery. Re-logins reuse the stored values.
   --basic-auth   Grafana username/password. Use --user or GRAFANA_USER, and GRAFANA_PASSWORD.
   --token        Grafana service-account token (created inside the Grafana instance).
                  See: ` + docs.ServiceAccounts + `
@@ -237,6 +285,7 @@ Auth sources (for non-interactive use):
   gcx login prod --server https://prod.grafana.net
   gcx login prod --server https://prod.grafana.net --oauth
   gcx login local --server https://grafana.example.com --basic-auth --user admin
+  gcx login onprem --server https://grafana.example.com --oidc
   gcx login --yes prod --token glsa_xxx
   gcx login --yes --server https://localhost:3000 --token glsa_xxx`,
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -270,7 +319,7 @@ func runLogin(cmd *cobra.Command, flags *loginOpts, args []string) error {
 		return err
 	}
 	if targetIsDeterministic && preflightTarget.Type == "local" &&
-		(flags.OAuth || flags.BasicAuth || credentialProvided(flags.Token, "GRAFANA_TOKEN") ||
+		(flags.OAuth || flags.oidc() || flags.BasicAuth || credentialProvided(flags.Token, "GRAFANA_TOKEN") ||
 			credentialProvided(flags.CloudToken, "GRAFANA_CLOUD_TOKEN")) {
 		return autoLocalFreshCredentialError(preflightTarget)
 	}
@@ -326,7 +375,7 @@ func runLogin(cmd *cobra.Command, flags *loginOpts, args []string) error {
 	if mutationTarget.Type == "local" {
 		target := mutationTarget
 		autoLocalTarget = &target
-		if flags.OAuth || flags.BasicAuth || credentialProvided(flags.Token, "GRAFANA_TOKEN") ||
+		if flags.OAuth || flags.oidc() || flags.BasicAuth || credentialProvided(flags.Token, "GRAFANA_TOKEN") ||
 			credentialProvided(flags.CloudToken, "GRAFANA_CLOUD_TOKEN") {
 			return autoLocalFreshCredentialError(target)
 		}
@@ -385,6 +434,12 @@ func runLogin(cmd *cobra.Command, flags *loginOpts, args []string) error {
 	grafanaTokenExplicit := credentialProvided(flags.Token, "GRAFANA_TOKEN")
 	cloudTokenExplicit := credentialProvided(flags.CloudToken, "GRAFANA_CLOUD_TOKEN")
 
+	// Re-auth default: a context that last logged in with OIDC keeps its
+	// identity provider unless this invocation names another auth method.
+	if !flags.oidc() && !flags.OAuth && !flags.BasicAuth && !grafanaTokenExplicit {
+		defaultOIDCFromContext(flags, persistedSourceCtx)
+	}
+
 	// Non-interactive callers (agent mode, --yes, piped stdin, CI) can't answer
 	// the auth prompt, so fall back to credentials resolved from the selected
 	// raw owner. resolveNonInteractiveTokens reads GRAFANA_TOKEN /
@@ -398,7 +453,7 @@ func runLogin(cmd *cobra.Command, flags *loginOpts, args []string) error {
 		flags.CloudToken,
 		credentialSourceCtx,
 		isInteractive,
-		flags.OAuth || flags.BasicAuth,
+		flags.OAuth || flags.oidc() || flags.BasicAuth,
 	)
 	if flags.signup {
 		// Signup saves the new stack connection only. A Cloud Access Policy
@@ -427,13 +482,13 @@ func runLogin(cmd *cobra.Command, flags *loginOpts, args []string) error {
 	// previously authenticated via OAuth defaults to OAuth instead of failing
 	// for missing grafana-auth. Runs after token resolution so a stored token
 	// still takes precedence.
-	if !flags.BasicAuth {
+	if !flags.BasicAuth && !flags.oidc() {
 		flags.OAuth = defaultOAuthFromContext(flags.OAuth, flags.Token, persistedSourceCtx, isInteractive)
 	}
-	if autoLocalTarget != nil && flags.OAuth {
+	if autoLocalTarget != nil && (flags.OAuth || flags.oidc()) {
 		return autoLocalFreshCredentialError(*autoLocalTarget)
 	}
-	if storedGrafanaTokenBlocked && !flags.OAuth {
+	if storedGrafanaTokenBlocked && !flags.OAuth && !flags.oidc() {
 		return grafanaDestinationChangeAuthError(persistedSourceCtx.Grafana.Server, flags.Server)
 	}
 
@@ -504,6 +559,10 @@ func runLogin(cmd *cobra.Command, flags *loginOpts, args []string) error {
 			GrafanaUser:                 flags.User,
 			OAuthCallbackPort:           flags.OAuthCallbackPort,
 			OAuthManual:                 flags.OAuthManual,
+			UseOIDC:                     flags.oidc(),
+			OIDCIssuer:                  flags.OIDCIssuer,
+			OIDCClientID:                flags.OIDCClientID,
+			OIDCScopes:                  flags.oidcScopes,
 			Reader:                      cmd.InOrStdin(),
 			Yes:                         flags.Yes,
 			Interactive:                 isInteractive,
@@ -523,6 +582,7 @@ func runLogin(cmd *cobra.Command, flags *loginOpts, args []string) error {
 			LoginMutationGuard:         loginMutationGuard,
 			CheckCredentialPersistence: cfg.CheckOAuthCredentialPersistence,
 			NewAuthFlow:                newAuthFlow,
+			NewOIDCFlow:                newOIDCFlow,
 			ValidateFn:                 validateConnection,
 		},
 		RetryState: login.RetryState{
@@ -635,7 +695,7 @@ func autoLocalFreshCredentialError(target config.ConfigSource) error {
 }
 
 func enforceAutoLocalCredentialPolicy(opts *login.Options, sourceCtx *config.Context, target config.ConfigSource) error {
-	if opts.UseOAuth || opts.UseBasicAuth || opts.UseCloudInstanceSelector || opts.CloudSignup {
+	if opts.UseOAuth || opts.UseOIDC || opts.UseBasicAuth || opts.UseCloudInstanceSelector || opts.CloudSignup {
 		return autoLocalFreshCredentialError(target)
 	}
 	if opts.GrafanaToken != "" {
@@ -1284,7 +1344,7 @@ func askForInput(
 				opts.UseOAuth = false
 				continue
 			}
-			if err := askGrafanaAuth(opts, existingGrafanaToken); err != nil {
+			if err := askGrafanaAuth(ctx, opts, existingGrafanaToken); err != nil {
 				return err
 			}
 
@@ -1554,19 +1614,39 @@ func cloudEndpointRequestDiffers(opts *login.Options, entry *config.CloudEntry, 
 // first option as the default, so a remote session promotes manual OAuth: the
 // browser there runs on another computer and cannot reach the local callback
 // address.
-func grafanaAuthOptions(target login.Target, hasMTLS, remote bool) []huh.Option[string] {
+// oidcMenuPrefix marks an auth menu value that selects a Grafana SSO login.
+const oidcMenuPrefix = "oidc:"
+
+func grafanaAuthOptions(target login.Target, hasMTLS, remote bool, ssoLogins []internalauth.GrafanaSSOLogin) []huh.Option[string] {
 	tokenOption := huh.NewOption("Service account token (requires permissions for managing service accounts)", "token")
 	oauthOption := huh.NewOption("OAuth (browser) — recommended for cloud stacks; experimental on some configurations, fall back to a service account token if you hit issues", "oauth")
 	oauthManualOption := huh.NewOption("OAuth (browser on another computer) — gcx prints a URL; you paste the redirect URL back. Use this over SSH", "oauth-manual")
 	basicOption := huh.NewOption("Basic auth (username/password)", "basic")
 	mtlsOption := huh.NewOption("Client certificate (mTLS) — authenticate via TLS client cert (e.g. Teleport)", "mtls")
 
+	// The SSO logins Grafana itself offers, under the names of its login
+	// buttons. Grafana must also accept the provider's ID tokens via
+	// [auth.jwt]; the login reports it clearly when it does not.
+	// Like gh, glab and the JFrog CLI, the entry says only that the login
+	// happens in the browser; several SSO logins are told apart by Grafana's
+	// button names.
+	var ssoOptions []huh.Option[string]
+	if target != login.TargetCloud {
+		for _, sso := range ssoLogins {
+			label := "Web login (browser)"
+			if len(ssoLogins) > 1 {
+				label += " – " + sso.Name
+			}
+			ssoOptions = append(ssoOptions, huh.NewOption(label, oidcMenuPrefix+sso.ID))
+		}
+	}
+
 	switch target {
 	case login.TargetOnPrem:
 		if hasMTLS {
-			return []huh.Option[string]{mtlsOption, tokenOption, basicOption}
+			return slices.Concat([]huh.Option[string]{mtlsOption}, ssoOptions, []huh.Option[string]{tokenOption, basicOption})
 		}
-		return []huh.Option[string]{tokenOption, basicOption}
+		return slices.Concat(ssoOptions, []huh.Option[string]{tokenOption, basicOption})
 	case login.TargetCloud:
 		if remote {
 			return []huh.Option[string]{oauthManualOption, oauthOption, tokenOption}
@@ -1574,13 +1654,21 @@ func grafanaAuthOptions(target login.Target, hasMTLS, remote bool) []huh.Option[
 		return []huh.Option[string]{oauthOption, oauthManualOption, tokenOption}
 	default: // TargetUnknown
 		if hasMTLS {
-			return []huh.Option[string]{mtlsOption, tokenOption, basicOption, oauthOption, oauthManualOption}
+			return slices.Concat([]huh.Option[string]{mtlsOption}, ssoOptions, []huh.Option[string]{tokenOption, basicOption, oauthOption, oauthManualOption})
 		}
-		return []huh.Option[string]{tokenOption, basicOption, oauthOption, oauthManualOption}
+		return slices.Concat(ssoOptions, []huh.Option[string]{tokenOption, basicOption, oauthOption, oauthManualOption})
 	}
 }
 
-func askGrafanaAuth(opts *login.Options, existingToken string) error {
+// ssoProbeTimeout bounds the SSO login lookup before the auth menu is shown.
+const ssoProbeTimeout = 5 * time.Second
+
+// grafanaSSOLogins is a test seam for the SSO login lookup behind the auth menu.
+//
+//nolint:gochecknoglobals // narrow test seam, like newAuthFlow.
+var grafanaSSOLogins = login.GrafanaSSOLogins
+
+func askGrafanaAuth(ctx context.Context, opts *login.Options, existingToken string) error {
 	// When TLS client certs are configured, mTLS is a valid standalone auth
 	// method (e.g. Teleport proxy). Offer it as the default choice.
 	hasMTLS := opts.TLS != nil && !opts.TLS.IsEmpty() &&
@@ -1590,7 +1678,15 @@ func askGrafanaAuth(opts *login.Options, existingToken string) error {
 		return nil // resolveGrafanaAuth will pick up the TLS case.
 	}
 
-	options := grafanaAuthOptions(opts.Target, hasMTLS, terminal.IsRemoteSession())
+	// A failed or slow lookup only means no SSO option is offered.
+	var ssoLogins []internalauth.GrafanaSSOLogin
+	if opts.Target != login.TargetCloud && opts.Server != "" {
+		probeCtx, cancel := context.WithTimeout(ctx, ssoProbeTimeout)
+		ssoLogins, _ = grafanaSSOLogins(probeCtx, *opts)
+		cancel()
+	}
+
+	options := grafanaAuthOptions(opts.Target, hasMTLS, terminal.IsRemoteSession(), ssoLogins)
 
 	// Default to the first option in the menu: OAuth for Cloud, mTLS when certs
 	// are present (non-Cloud), token otherwise. Deriving from options[0] keeps
@@ -1612,6 +1708,13 @@ func askGrafanaAuth(opts *login.Options, existingToken string) error {
 		opts.UseBasicAuth = true
 		readBasicAuthEnvironment(opts, true)
 		return askBasicAuth(opts)
+	}
+	if provider, ok := strings.CutPrefix(authMethod, oidcMenuPrefix); ok {
+		// The provider's issuer and client ID are discovered for this login
+		// only once it is chosen.
+		opts.UseOIDC = true
+		opts.OIDCProvider = provider
+		return nil
 	}
 	if authMethod == "oauth-manual" {
 		opts.UseOAuth = true
@@ -1919,6 +2022,20 @@ func defaultOAuthFromContext(useOAuth bool, grafanaToken string, sourceCtx *conf
 		return useOAuth
 	}
 	return sourceCtx.Grafana.AuthMethod == "oauth"
+}
+
+// defaultOIDCFromContext fills the OIDC issuer and client ID from a context
+// that last logged in with OIDC, so `gcx login <ctx>` repeats that login.
+func defaultOIDCFromContext(flags *loginOpts, sourceCtx *config.Context) {
+	if sourceCtx == nil || sourceCtx.Grafana == nil || sourceCtx.Grafana.AuthMethod != "oidc" {
+		return
+	}
+	flags.OIDCIssuer = sourceCtx.Grafana.OIDCIssuer
+	flags.OIDCClientID = sourceCtx.Grafana.OIDCClientID
+	flags.oidcScopes = strings.Fields(sourceCtx.Grafana.OIDCScopes)
+	// A context without a stored provider still selects OIDC; the login
+	// then discovers the provider again.
+	flags.OIDC = true
 }
 
 // printModeHeader writes a one- or two-line status banner so the user
